@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -12,7 +13,8 @@ from urllib.parse import quote
 
 CHANGELOG_MARKER = "<!-- RELEASE_CHANGELOG -->"
 DOWNLOADS_MARKER = "<!-- RELEASE_DOWNLOADS -->"
-REPOSITORY_RELEASE_URL = "https://github.com/AnalyseDeCircuit/oxideterm/releases/download"
+REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "AnalyseDeCircuit/oxideterm")  # 兜底值可留可删
+REPOSITORY_RELEASE_URL = f"https://github.com/{REPOSITORY}/releases/download"
 
 
 def normalize_leading_summary(section: str) -> str:

@@ -64,7 +64,7 @@ jobs:
               echo 'Release publishing requires release_tag.' >&2
               exit 1
             fi
-            if [[ ! "${INPUT_RELEASE_TAG}" =~ ^(v|native-v|gpui-v)[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            if [[ ! "${INPUT_RELEASE_TAG}" =~ ^(v|native-v|gpui-v)[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(-[0-9]+)?$ ]]; then
               echo "Unsupported release tag: ${INPUT_RELEASE_TAG}" >&2
               exit 1
             fi
@@ -87,6 +87,9 @@ jobs:
           version="${raw_version#native-v}"
           version="${version#gpui-v}"
           version="${version#v}"
+          if [[ "${version}" =~ ^([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?)-[0-9]+$ ]]; then
+            version="${BASH_REMATCH[1]}"
+          fi
           if [[ "${INPUT_UPLOAD_RELEASE}" == "true" && -n "${INPUT_VERSION}" ]]; then
             input_version="${INPUT_VERSION#native-v}"
             input_version="${input_version#gpui-v}"
@@ -130,13 +133,20 @@ jobs:
             os: macos-15-intel
             target: x86_64-apple-darwin
           - label: linux-x64
-            os: ubuntu-22.04
+            # Hosted ubuntu-18.04 runners were fully removed on 2022-12-01;
+            # keep the glibc 2.27 baseline by compiling inside an
+            # ubuntu:18.04 container on a current runner image.
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            build_image: ubuntu:18.04
           - label: linux-arm64
-            # Keep the Linux release baseline at glibc 2.35 for distributions
-            # such as Kylin V11, matching the existing x64 package baseline.
-            os: ubuntu-22.04-arm
+            # Keep the Linux release baseline at glibc 2.27 (Ubuntu 18.04)
+            # for distributions such as Kylin V10, matching the existing
+            # x64 package baseline. ubuntu:18.04 is multi-arch, so the arm64
+            # runner automatically gets the aarch64 image layers.
+            os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            build_image: ubuntu:18.04
           - label: windows-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -199,7 +209,8 @@ jobs:
             "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${appimage_arch}.AppImage"
           echo "${appimage_sha256}  appimagetool" | sha256sum --check --strict
           chmod +x appimagetool
-          sudo mv appimagetool /usr/local/bin/appimagetool
+          # Keep the tool in the workspace; the build container symlinks it
+          # into /usr/local/bin instead (the container runs as root).
 
       - name: Install Windows system dependencies
         if: runner.os == 'Windows'
@@ -322,10 +333,53 @@ jobs:
 
           rm -f "${certificate_path}" "${identity_path}"
 
-      - name: Package native app
+      - name: Package native app (Linux, glibc 2.27 container)
+        if: runner.os == 'Linux'
         env:
           OXIDETERM_VERSION: ${{ needs.validate-release-request.outputs.raw_version }}
-          APPIMAGE_EXTRACT_AND_RUN: ${{ runner.os == 'Linux' && '1' || '' }}
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          TARGET: ${{ matrix.target }}
+          BUILD_IMAGE: ${{ matrix.build_image }}
+          EXTRA_PACKAGES: 'curl file patchelf desktop-file-utils dpkg-dev rpm freerdp2-dev'
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD:/src" -w /src \
+            -v "$HOME/.cargo:/root/.cargo" \
+            -v "$HOME/.rustup:/root/.rustup" \
+            -e OXIDETERM_VERSION -e APPIMAGE_EXTRACT_AND_RUN -e TARGET -e EXTRA_PACKAGES \
+            "${BUILD_IMAGE}" \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+
+              # ubuntu:18.04 does not ship sudo; install it so the shared
+              # install-linux-deps.sh runs unmodified (it hardcodes sudo).
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends git build-essential xz-utils zip unzip curl ca-certificates \
+              sudo pkg-config clang libclang-dev \
+              libkrb5-dev libudev-dev libdbus-1-dev \
+              libxkbcommon-dev libxcb1-dev
+
+              # Reuse the repo script verbatim; EXTRA_PACKAGES flows through
+              # exactly as the composite action passes it.
+              /src/scripts/ci/install-linux-deps.sh
+
+              export PATH="/root/.cargo/bin:$PATH"
+
+              # Ubuntu 18.04 ships Python 3.6 only; provision a modern
+              # glibc-2.17-baseline interpreter via uv for packaging.
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="/root/.local/bin:$PATH"
+              uv python install 3.12
+
+              ln -sf /src/appimagetool /usr/local/bin/appimagetool
+              "$(uv python find 3.12)" scripts/release/package_native.py "$TARGET"
+            '
+
+      - name: Package native app (non-Linux)
+        if: runner.os != 'Linux'
+        env:
+          OXIDETERM_VERSION: ${{ needs.validate-release-request.outputs.raw_version }}
         run: python scripts/release/package_native.py ${{ matrix.target }}
 
       - name: Remove temporary signing material
@@ -336,6 +390,12 @@ jobs:
           if [[ "${RUNNER_OS}" == 'macOS' && -n "${MACOS_SIGNING_KEYCHAIN:-}" ]]; then
             security delete-keychain "${MACOS_SIGNING_KEYCHAIN}" || true
           fi
+
+      - name: Restore workspace ownership for host steps
+        if: runner.os == 'Linux' && always()
+        shell: bash
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "$PWD" "$HOME/.cargo" "$HOME/.rustup"
 
       - name: Verify native package contents
         run: >-
@@ -403,6 +463,7 @@ jobs:
       tag: ${{ steps.release_meta.outputs.tag }}
       version: ${{ steps.release_meta.outputs.version }}
       prerelease: ${{ steps.release_meta.outputs.prerelease }}
+      signed: ${{ steps.sign_assets.outputs.signed }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -440,6 +501,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
           RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -471,6 +533,7 @@ jobs:
           echo "body_path=release-notes.md" >> "${GITHUB_OUTPUT}"
 
       - name: Sign release assets
+        id: sign_assets
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -478,6 +541,13 @@ jobs:
           VERSION: ${{ steps.release_meta.outputs.version }}
         run: |
           set -euo pipefail
+
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo 'Signing key not configured; producing unsigned release assets.'
+            echo 'signed=false' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
           sudo apt-get update
           sudo apt-get install -y minisign
 
@@ -514,6 +584,8 @@ jobs:
             fi
           done
 
+          echo 'signed=true' >> "${GITHUB_OUTPUT}"
+
       - name: Generate release checksums
         shell: bash
         run: |
@@ -548,7 +620,7 @@ jobs:
             dist-release/*.AppImage
             dist-release/*.deb
             dist-release/*.rpm
-            dist-release/*.sig
+            ${{ steps.sign_assets.outputs.signed == 'true' && 'dist-release/*.sig' || '' }}
             dist-release/sha256sums.txt
           tag_name: ${{ steps.release_meta.outputs.tag }}
           target_commitish: ${{ needs.validate-release-request.outputs.release_commit }}
@@ -568,7 +640,7 @@ jobs:
     name: Generate updater manifest
     needs: release
     runs-on: ubuntu-latest
-    if: inputs.upload_release
+    if: inputs.upload_release && needs.release.outputs.signed == 'true'
     permissions:
       contents: write
     steps:
@@ -761,7 +833,7 @@ jobs:
       - release
       - publish-updater
     runs-on: ubuntu-latest
-    if: needs.release.outputs.prerelease == 'true' && (startsWith(needs.release.outputs.tag, 'gpui-v') || contains(needs.release.outputs.version, 'gpui-preview') || contains(needs.release.outputs.version, 'native-preview') || contains(needs.release.outputs.version, 'rustnative-preview'))
+    if: needs.release.outputs.prerelease == 'true' && needs.release.outputs.signed == 'true' && (startsWith(needs.release.outputs.tag, 'gpui-v') || contains(needs.release.outputs.version, 'gpui-preview') || contains(needs.release.outputs.version, 'native-preview') || contains(needs.release.outputs.version, 'rustnative-preview'))
     permissions:
       contents: write
     steps:
@@ -842,7 +914,7 @@ jobs:
       - release
       - publish-updater
     runs-on: ubuntu-latest
-    if: inputs.upload_release
+    if: inputs.upload_release && needs.release.outputs.signed == 'true'
     permissions:
       contents: write
     steps:
@@ -884,6 +956,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.release.outputs.tag }}
           RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          SIGNED: ${{ needs.release.outputs.signed }}
         with:
           script: |
             const tag = process.env.RELEASE_TAG;
@@ -905,7 +978,7 @@ jobs:
             }
 
             const expected = [
-              'latest.json',
+              ...(process.env.SIGNED === 'true' ? ['latest.json'] : []),
               'sha256sums.txt',
               `OxideTerm_${version}_macos_arm64.app.zip`,
               `OxideTerm_${version}_macos_arm64.dmg`,

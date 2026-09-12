@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import plistlib
+import re
 import shutil
 import stat
 import subprocess
@@ -259,6 +260,7 @@ def normalized_version(raw: str) -> str:
     for prefix in ("refs/tags/", "native-v", "gpui-v", "v"):
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
+    raw = re.sub(r"-\d+$", "", raw)
     return raw
 
 

@@ -27,7 +27,7 @@ concurrency:
 jobs:
   rust:
     name: Rust workspace (check + fmt + test)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,6 +54,45 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+  rust-baseline:
+    name: Rust check on glibc 2.27 (Ubuntu 18.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.94.1
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ci-baseline-18.04
+          cache-on-failure: false
+
+      - name: cargo check inside Ubuntu 18.04 container
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD:/src" -w /src \
+            -v "$HOME/.cargo:/root/.cargo" \
+            -v "$HOME/.rustup:/root/.rustup" \
+            ubuntu:18.04 \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends git build-essential xz-utils zip unzip curl ca-certificates \
+              sudo pkg-config clang libclang-dev \
+              libkrb5-dev libudev-dev libdbus-1-dev \
+              libxkbcommon-dev libxcb1-dev
+              /src/scripts/ci/install-linux-deps.sh
+              export PATH="/root/.cargo/bin:$PATH"
+              cargo check --workspace --all-targets
+            '
 
   i18n:
     name: i18n completeness
